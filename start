@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slideshow</title>
+<style>
+  :root {
+    --fade: 800ms;
+    --fit: contain;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #000; color: #fff;
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  #stage { position: fixed; inset: 0; }
+  #stage img {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: var(--fit);
+    opacity: 0;
+    transition: opacity var(--fade) ease-in-out;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+  #stage img.active { opacity: 1; }
+
+  #msg {
+    position: fixed; inset: 0;
+    display: none; place-items: center;
+    padding: 2rem; text-align: center;
+    color: #bbb; line-height: 1.7;
+  }
+  #msg code { background: #1c1c1c; padding: 2px 6px; border-radius: 5px; }
+
+  #startOverlay {
+    position: fixed; inset: 0;
+    display: none;
+    place-items: center;
+    background: rgba(0,0,0,.7);
+    color: #fff;
+    font-size: 1.2rem;
+    cursor: pointer;
+    z-index: 100;
+    text-align: center;
+    padding: 2rem;
+  }
+  #startOverlay.visible { display: grid; }
+</style>
+</head>
+<body>
+
+<div id="stage"></div>
+<div id="msg"></div>
+<div id="startOverlay">Click anywhere to start fullscreen slideshow</div>
+
+<script type="module">
+const stage        = document.getElementById('stage');
+const msg          = document.getElementById('msg');
+const startOverlay = document.getElementById('startOverlay');
+
+function fail(html) {
+  msg.innerHTML = html;
+  msg.style.display = 'grid';
+}
+
+async function loadJSON(url, fallback) {
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) return fallback;
+    return await res.json();
+  } catch {
+    return fallback;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Configuration
+ * ------------------------------------------------------------------ */
+const cfg = Object.assign({
+  duration: 5,        // default seconds per image
+  transition: 800,    // crossfade length in ms
+  fit: 'contain',     // 'contain' (letterbox) or 'cover' (fill & crop)
+  syncEpoch: 0        // ms since Unix epoch for global sync (0 = 1970-01-01)
+}, await loadJSON('config.json', {}));
+
+const q = new URLSearchParams(location.search);
+if (q.has('t'))     cfg.duration  = parseFloat(q.get('t'));
+if (q.has('fit'))   cfg.fit       = q.get('fit');
+if (q.has('epoch')) cfg.syncEpoch = parseInt(q.get('epoch'), 10);
+
+if (!Number.isFinite(cfg.duration) || cfg.duration <= 0) cfg.duration = 5;
+cfg.fit = cfg.fit === 'cover' ? 'cover' : 'contain';
+if (!Number.isFinite(cfg.syncEpoch)) cfg.syncEpoch = 0;
+
+document.documentElement.style.setProperty('--fade', `${cfg.transition}ms`);
+document.documentElement.style.setProperty('--fit', cfg.fit);
+
+/* ------------------------------------------------------------------ *
+ * Image list
+ * ------------------------------------------------------------------ */
+let items = await loadJSON('images.json', []);
+items = (Array.isArray(items) ? items : [])
+  .map(x => (typeof x === 'string' ? { src: x } : x))
+  .filter(x => x && typeof x.src === 'string');
+
+if (!items.length) {
+  fail('<div>No images found.<br>Put files in <code>images/</code> and list them in <code>images.json</code>.</div>');
+} else {
+  start();
+}
+
+/* ------------------------------------------------------------------ *
+ * Slideshow
+ * ------------------------------------------------------------------ */
+function start() {
+  /* --- Build timeline with cumulative start times --- */
+  let cumulative = 0;
+  const timeline = items.map(item => {
+    const d = Number(item.duration);
+    const durationMs = (Number.isFinite(d) && d > 0 ? d : cfg.duration) * 1000;
+    const entry = { ...item, start: cumulative, duration: durationMs };
+    cumulative += durationMs;
+    return entry;
+  });
+  const totalCycle = cumulative;
+
+  /* --- Two stacked <img> layers for crossfading --- */
+  const layers = [new Image(), new Image()];
+  layers.forEach(el => {
+    el.alt = '';
+    el.decoding = 'async';
+    stage.append(el);
+  });
+  let front = 0;
+
+  const cache = new Map();
+  function preload(src) {
+    if (!cache.has(src)) {
+      const img = new Image();
+      img.src = src;
+      cache.set(src, img);
+    }
+  }
+
+  function render(src) {
+    const back = 1 - front;
+    const el = layers[back];
+    let done = false;
+
+    const reveal = () => {
+      if (done) return;
+      done = true;
+      el.classList.add('active');
+      layers[front].classList.remove('active');
+      front = back;
+    };
+
+    // Force a reload if this layer already holds this exact image
+    if (el.getAttribute('src') === src) el.removeAttribute('src');
+
+    el.onload  = () => requestAnimationFrame(reveal);
+    el.onerror = () => console.warn('Could not load:', src);
+    el.src = src;
+
+    if (el.complete && el.naturalWidth > 0) requestAnimationFrame(reveal);
+  }
+
+  let currentIndex = -1;
+  let timeoutId    = null;
+
+  function showIndex(index) {
+    if (index === currentIndex) return;
+    currentIndex = index;
+    const item = timeline[index];
+    render(item.src);
+    // Preload the next image
+    const nextIndex = (index + 1) % timeline.length;
+    preload(timeline[nextIndex].src);
+  }
+
+  function scheduleNext() {
+    if (timeoutId) clearTimeout(timeoutId);
+
+    const now     = Date.now();
+    const elapsed = ((now - cfg.syncEpoch) % totalCycle + totalCycle) % totalCycle;
+
+    // Find which image should be visible right now
+    let idx = timeline.findIndex(t => elapsed >= t.start && elapsed < t.start + t.duration);
+    if (idx === -1) idx = 0; // fallback
+
+    showIndex(idx);
+
+    // Time until the next boundary
+    const current       = timeline[idx];
+    const nextBoundary  = current.start + current.duration;
+    let   delay         = nextBoundary - elapsed;
+    if (delay <= 0) delay = 100; // safety
+
+    timeoutId = setTimeout(scheduleNext, delay);
+  }
+
+  // Resync when the tab becomes visible again (browsers throttle timers in background)
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) scheduleNext();
+  });
+
+  // Start the loop
+  scheduleNext();
+
+  /* --- Fullscreen handling --- */
+  function requestFS() {
+    if (document.fullscreenElement) return;
+    const el = document.documentElement;
+    if (el.requestFullscreen) {
+      el.requestFullscreen().catch(() => startOverlay.classList.add('visible'));
+    } else if (el.webkitRequestFullscreen) {
+      el.webkitRequestFullscreen();
+    } else {
+      startOverlay.classList.add('visible');
+    }
+  }
+
+  // Try to go fullscreen automatically on load
+  requestFS();
+
+  // If the browser blocked auto‑fullscreen, show a click‑to‑start overlay
+  startOverlay.addEventListener('click', () => {
+    startOverlay.classList.remove('visible');
+    requestFS();
+  });
+
+  // Hide the overlay once fullscreen is entered
+  document.addEventListener('fullscreenchange', () => {
+    if (document.fullscreenElement) startOverlay.classList.remove('visible');
+  });
+}
+</script>
+</body>
+</html>
