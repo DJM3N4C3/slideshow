@@ -1,0 +1,7 @@
+{
+  "duration": 5,
+  "transition": 800,
+  "fit": "contain",
+  "syncEpoch": 0,
+  "imageFolder": "images"
+}
