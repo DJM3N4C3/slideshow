@@ -5,10 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Slideshow</title>
 <style>
-  :root {
-    --fade: 800ms;
-    --fit: contain;
-  }
+  :root { --fade: 800ms; --fit: contain; }
   * { box-sizing: border-box; }
   html, body {
     margin: 0; height: 100%; overflow: hidden;
@@ -37,15 +34,10 @@
 
   #startOverlay {
     position: fixed; inset: 0;
-    display: none;
-    place-items: center;
-    background: rgba(0,0,0,.7);
-    color: #fff;
-    font-size: 1.2rem;
-    cursor: pointer;
-    z-index: 100;
-    text-align: center;
-    padding: 2rem;
+    display: none; place-items: center;
+    background: rgba(0,0,0,.7); color: #fff;
+    font-size: 1.2rem; cursor: pointer;
+    z-index: 100; text-align: center; padding: 2rem;
   }
   #startOverlay.visible { display: grid; }
 </style>
@@ -71,19 +63,18 @@ async function loadJSON(url, fallback) {
     const res = await fetch(url, { cache: 'no-store' });
     if (!res.ok) return fallback;
     return await res.json();
-  } catch {
-    return fallback;
-  }
+  } catch { return fallback; }
 }
 
 /* ------------------------------------------------------------------ *
  * Configuration
  * ------------------------------------------------------------------ */
 const cfg = Object.assign({
-  duration: 5,        // default seconds per image
-  transition: 800,    // crossfade length in ms
-  fit: 'contain',     // 'contain' (letterbox) or 'cover' (fill & crop)
-  syncEpoch: 0        // ms since Unix epoch for global sync (0 = 1970-01-01)
+  duration: 5,        // seconds per image (global)
+  transition: 800,    // crossfade ms
+  fit: 'contain',     // 'contain' or 'cover'
+  syncEpoch: 0,       // global sync anchor (ms since Unix epoch)
+  imageFolder: 'images'
 }, await loadJSON('config.json', {}));
 
 const q = new URLSearchParams(location.search);
@@ -99,15 +90,71 @@ document.documentElement.style.setProperty('--fade', `${cfg.transition}ms`);
 document.documentElement.style.setProperty('--fit', cfg.fit);
 
 /* ------------------------------------------------------------------ *
- * Image list
+ * Auto-detect GitHub owner/repo from the page URL
+ * (works for username.github.io/repo and username.github.io)
+ * Set REPO_OVERRIDE if you use a custom domain.
  * ------------------------------------------------------------------ */
-let items = await loadJSON('images.json', []);
-items = (Array.isArray(items) ? items : [])
-  .map(x => (typeof x === 'string' ? { src: x } : x))
-  .filter(x => x && typeof x.src === 'string');
+const REPO_OVERRIDE = null; // e.g. { owner: "me", repo: "slideshow", branch: "main" }
+
+function detectRepo() {
+  const host = location.hostname;
+  if (!host.endsWith('.github.io')) return null;
+  const owner = host.replace(/\.github\.io$/i, '');
+  const parts = location.pathname.split('/').filter(Boolean);
+  const repo  = parts[0] || `${owner}.github.io`;
+  return { owner, repo, branch: null };
+}
+
+/* ------------------------------------------------------------------ *
+ * Fetch list of images in the folder
+ * ------------------------------------------------------------------ */
+async function fetchFromGitHub({ owner, repo, branch }) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${cfg.imageFolder}` +
+              (branch ? `?ref=${encodeURIComponent(branch)}` : '');
+  const res = await fetch(url, { headers: { Accept: 'application/vnd.github+json' } });
+  if (!res.ok) throw new Error(`GitHub API ${res.status}`);
+  const data = await res.json();
+  if (!Array.isArray(data)) throw new Error('Unexpected API response');
+  return data
+    .filter(f => f.type === 'file' && /\.(jpe?g|png|gif)$/i.test(f.name))
+    .map(f => f.path)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+}
+
+async function getImageList() {
+  const cached = sessionStorage.getItem('slideshow.images');
+  if (cached) {
+    try {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed) && parsed.length) return parsed;
+    } catch {}
+  }
+
+  const repoInfo = detectRepo() || REPO_OVERRIDE;
+  if (repoInfo) {
+    try {
+      const files = await fetchFromGitHub(repoInfo);
+      if (files.length) {
+        sessionStorage.setItem('slideshow.images', JSON.stringify(files));
+        return files;
+      }
+    } catch (e) {
+      console.warn('GitHub auto-discovery failed:', e);
+    }
+  }
+
+  // Local testing / fallback
+  let fallback = await loadJSON('images.json', []);
+  fallback = (Array.isArray(fallback) ? fallback : [])
+    .map(x => (typeof x === 'string' ? x : x?.src))
+    .filter(Boolean);
+  return fallback;
+}
+
+const items = await getImageList();
 
 if (!items.length) {
-  fail('<div>No images found.<br>Put files in <code>images/</code> and list them in <code>images.json</code>.</div>');
+  fail('<div>No images found.<br>Put JPG / PNG / GIF files in the <code>images/</code> folder of your repo and refresh.</div>');
 } else {
   start();
 }
@@ -116,40 +163,23 @@ if (!items.length) {
  * Slideshow
  * ------------------------------------------------------------------ */
 function start() {
-  /* --- Build timeline with cumulative start times --- */
-  let cumulative = 0;
-  const timeline = items.map(item => {
-    const d = Number(item.duration);
-    const durationMs = (Number.isFinite(d) && d > 0 ? d : cfg.duration) * 1000;
-    const entry = { ...item, start: cumulative, duration: durationMs };
-    cumulative += durationMs;
-    return entry;
-  });
-  const totalCycle = cumulative;
+  // Timeline: each image lasts cfg.duration seconds (global setting)
+  const durationMs = cfg.duration * 1000;
+  const totalCycle = durationMs * items.length;
 
-  /* --- Two stacked <img> layers for crossfading --- */
   const layers = [new Image(), new Image()];
-  layers.forEach(el => {
-    el.alt = '';
-    el.decoding = 'async';
-    stage.append(el);
-  });
+  layers.forEach(el => { el.alt = ''; el.decoding = 'async'; stage.append(el); });
   let front = 0;
 
   const cache = new Map();
   function preload(src) {
-    if (!cache.has(src)) {
-      const img = new Image();
-      img.src = src;
-      cache.set(src, img);
-    }
+    if (!cache.has(src)) { const i = new Image(); i.src = src; cache.set(src, i); }
   }
 
   function render(src) {
     const back = 1 - front;
     const el = layers[back];
     let done = false;
-
     const reveal = () => {
       if (done) return;
       done = true;
@@ -157,14 +187,10 @@ function start() {
       layers[front].classList.remove('active');
       front = back;
     };
-
-    // Force a reload if this layer already holds this exact image
     if (el.getAttribute('src') === src) el.removeAttribute('src');
-
     el.onload  = () => requestAnimationFrame(reveal);
     el.onerror = () => console.warn('Could not load:', src);
     el.src = src;
-
     if (el.complete && el.naturalWidth > 0) requestAnimationFrame(reveal);
   }
 
@@ -174,11 +200,8 @@ function start() {
   function showIndex(index) {
     if (index === currentIndex) return;
     currentIndex = index;
-    const item = timeline[index];
-    render(item.src);
-    // Preload the next image
-    const nextIndex = (index + 1) % timeline.length;
-    preload(timeline[nextIndex].src);
+    render(items[index]);
+    preload(items[(index + 1) % items.length]);
   }
 
   function scheduleNext() {
@@ -187,52 +210,34 @@ function start() {
     const now     = Date.now();
     const elapsed = ((now - cfg.syncEpoch) % totalCycle + totalCycle) % totalCycle;
 
-    // Find which image should be visible right now
-    let idx = timeline.findIndex(t => elapsed >= t.start && elapsed < t.start + t.duration);
-    if (idx === -1) idx = 0; // fallback
-
+    const idx = Math.floor(elapsed / durationMs) % items.length;
     showIndex(idx);
 
-    // Time until the next boundary
-    const current       = timeline[idx];
-    const nextBoundary  = current.start + current.duration;
-    let   delay         = nextBoundary - elapsed;
-    if (delay <= 0) delay = 100; // safety
-
+    const nextBoundary = (idx + 1) * durationMs;
+    let delay = nextBoundary - elapsed;
+    if (delay <= 0) delay = 100;
     timeoutId = setTimeout(scheduleNext, delay);
   }
 
-  // Resync when the tab becomes visible again (browsers throttle timers in background)
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) scheduleNext();
   });
 
-  // Start the loop
   scheduleNext();
 
-  /* --- Fullscreen handling --- */
+  /* Fullscreen */
   function requestFS() {
     if (document.fullscreenElement) return;
     const el = document.documentElement;
-    if (el.requestFullscreen) {
-      el.requestFullscreen().catch(() => startOverlay.classList.add('visible'));
-    } else if (el.webkitRequestFullscreen) {
-      el.webkitRequestFullscreen();
-    } else {
-      startOverlay.classList.add('visible');
-    }
+    if (el.requestFullscreen) el.requestFullscreen().catch(() => startOverlay.classList.add('visible'));
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    else startOverlay.classList.add('visible');
   }
-
-  // Try to go fullscreen automatically on load
   requestFS();
-
-  // If the browser blocked auto‑fullscreen, show a click‑to‑start overlay
   startOverlay.addEventListener('click', () => {
     startOverlay.classList.remove('visible');
     requestFS();
   });
-
-  // Hide the overlay once fullscreen is entered
   document.addEventListener('fullscreenchange', () => {
     if (document.fullscreenElement) startOverlay.classList.remove('visible');
   });
